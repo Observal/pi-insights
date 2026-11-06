@@ -47,6 +47,10 @@ const FACET_CONCURRENCY = 50;
 const META_BATCH_SIZE = 50;
 const LOAD_BATCH_SIZE = 10;
 const OVERLAP_WINDOW_MS = 30 * 60_000;
+// Gaps between messages longer than this count as idle, not active time
+const IDLE_GAP_MS = 30 * 60_000;
+// Bump when SessionMeta extraction changes so cached metas are rebuilt
+const META_VERSION = 2;
 
 const EXTENSION_TO_LANGUAGE: Record<string, string> = {
 	".ts": "TypeScript",
@@ -185,6 +189,8 @@ type SessionMeta = {
 	message_hours: number[];
 	user_message_timestamps: string[];
 	model_usage: Record<string, { input_tokens: number; output_tokens: number; cost: number; message_count: number }>;
+	meta_version?: number;
+	source_modified?: string;
 };
 
 type SessionFacets = {
@@ -292,10 +298,17 @@ async function ensureDirs(): Promise<void> {
 	await mkdir(FACETS_DIR, { recursive: true });
 }
 
-async function loadCachedMeta(sessionId: string): Promise<SessionMeta | null> {
+async function loadCachedMeta(info: { id: string; modified: Date }): Promise<SessionMeta | null> {
 	try {
-		const raw = await readFile(join(META_DIR, `${sessionId}.json`), "utf-8");
-		return JSON.parse(raw) as SessionMeta;
+		const raw = await readFile(join(META_DIR, `${info.id}.json`), "utf-8");
+		const meta = JSON.parse(raw) as SessionMeta;
+		// Rebuild when the session grew since caching or the extractor changed
+		if (
+			meta.meta_version !== META_VERSION ||
+			meta.source_modified !== info.modified.toISOString()
+		)
+			return null;
+		return meta;
 	} catch {
 		return null;
 	}
@@ -573,6 +586,7 @@ function extractSessionStats(entries: AnyEntry[], sessionPath: string) {
 	const modelUsage: Record<string, { input_tokens: number; output_tokens: number; cost: number; message_count: number }> = {};
 
 	let lastAssistantTs: number | null = null;
+	const activityTimestamps: number[] = [];
 
 	// Deduplicate tool call IDs to avoid double-counting branched entries
 	const seenToolCallIds = new Set<string>();
@@ -583,6 +597,7 @@ function extractSessionStats(entries: AnyEntry[], sessionPath: string) {
 		if (!msg) continue;
 
 		const msgTs = typeof msg.timestamp === "number" ? msg.timestamp : null;
+		if (msgTs) activityTimestamps.push(msgTs);
 
 		// ── assistant message ──
 		if (msg.role === "assistant") {
@@ -696,7 +711,12 @@ function extractSessionStats(entries: AnyEntry[], sessionPath: string) {
 				toolErrors++;
 				const resultText = extractTextFromContent(msg.content).toLowerCase();
 				let cat = "Other";
-				if (resultText.includes("exit code")) cat = "Command Failed";
+				if (
+					resultText.includes("exit code") ||
+					resultText.includes("exited with code")
+				)
+					cat = "Command Failed";
+				else if (resultText.includes("timed out")) cat = "Timed Out";
 				else if (
 					resultText.includes("rejected") ||
 					resultText.includes("doesn't want")
@@ -716,7 +736,8 @@ function extractSessionStats(entries: AnyEntry[], sessionPath: string) {
 					cat = "File Too Large";
 				else if (
 					resultText.includes("file not found") ||
-					resultText.includes("does not exist")
+					resultText.includes("does not exist") ||
+					resultText.includes("no such file")
 				)
 					cat = "File Not Found";
 				toolErrorCategories[cat] = (toolErrorCategories[cat] ?? 0) + 1;
@@ -747,7 +768,19 @@ function extractSessionStats(entries: AnyEntry[], sessionPath: string) {
 		assistantMessageCount,
 		firstPrompt,
 		modelUsage,
+		activeMinutes: activeMinutes(activityTimestamps),
 	};
+}
+
+/** Sum of gaps between consecutive messages, skipping idle gaps (resumed sessions) */
+function activeMinutes(timestamps: number[]): number {
+	const sorted = [...timestamps].sort((a, b) => a - b);
+	let activeMs = 0;
+	for (let i = 1; i < sorted.length; i++) {
+		const gap = sorted[i]! - sorted[i - 1]!;
+		if (gap <= IDLE_GAP_MS) activeMs += gap;
+	}
+	return Math.round(activeMs / 60_000);
 }
 
 function buildSessionMeta(
@@ -766,9 +799,7 @@ function buildSessionMeta(
 		session_path: info.path,
 		project_path: info.cwd,
 		start_time: info.created.toISOString(),
-		duration_minutes: Math.round(
-			(info.modified.getTime() - info.created.getTime()) / 1000 / 60,
-		),
+		duration_minutes: stats.activeMinutes,
 		user_message_count: stats.userMessageCount,
 		assistant_message_count: stats.assistantMessageCount,
 		tool_counts: stats.toolCounts,
@@ -791,6 +822,8 @@ function buildSessionMeta(
 		message_hours: stats.messageHours,
 		user_message_timestamps: stats.userMessageTimestamps,
 		model_usage: stats.modelUsage,
+		meta_version: META_VERSION,
+		source_modified: info.modified.toISOString(),
 	};
 }
 
@@ -1270,11 +1303,21 @@ async function callModel(
 		},
 		{ apiKey, headers },
 	);
+	if (response.stopReason === "error" || response.stopReason === "aborted")
+		throw new Error(response.errorMessage || `Model call ${response.stopReason}`);
 
 	return response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map((c) => c.text)
 		.join("");
+}
+
+function notifyModelErrors(ctx: ExtensionCommandContext, errors: string[]): void {
+	if (!errors.length) return;
+	ctx.ui.notify(
+		`⚠️ ${errors.length} model call(s) failed, so the report is incomplete. First error: ${errors[0]!.slice(0, 300)}`,
+		"warning",
+	);
 }
 
 function parseJsonFromResponse(text: string): unknown {
@@ -2525,7 +2568,7 @@ async function runInsights(
 	for (let i = 0; i < allInfos.length; i += META_BATCH_SIZE) {
 		const batch = allInfos.slice(i, i + META_BATCH_SIZE);
 		const results = await Promise.all(
-			batch.map((info) => loadCachedMeta(info.id)),
+			batch.map((info) => loadCachedMeta(info)),
 		);
 		for (let j = 0; j < batch.length; j++) {
 			const cached = results[j];
@@ -2596,6 +2639,8 @@ async function runInsights(
 
 	// ── Phase 3: Facet Extraction ─────────────────────────────────────────────────
 	const facetsMap = new Map<string, SessionFacets>();
+	// Model call failures, reported at the end instead of silently dropped
+	const modelErrors: string[] = [];
 
 	// Load cached facets
 	for (const meta of substantive) {
@@ -2666,8 +2711,9 @@ RESPOND WITH ONLY A VALID JSON OBJECT:
 							await saveFacets(facets);
 							facetsMap.set(meta.session_id, facets);
 						}
-					} catch {
+					} catch (err) {
 						// Skip failed extractions
+						modelErrors.push((err as Error).message);
 					}
 					facetsDone++;
 					ctx.ui.setWidget("insights", [
@@ -2718,8 +2764,9 @@ RESPOND WITH ONLY A VALID JSON OBJECT:
 				const text = await callModel(ctx, sectionPrompts[key], 8192);
 				const parsed = parseJsonFromResponse(text);
 				if (parsed) sectionResults[key] = parsed;
-			} catch {
+			} catch (err) {
 				// Section failed — continue without it
+				modelErrors.push((err as Error).message);
 			}
 			sectionsDone++;
 			ctx.ui.setWidget("insights", [
@@ -2748,7 +2795,8 @@ RESPOND WITH ONLY A VALID JSON OBJECT:
 		);
 		synthesis =
 			(parseJsonFromResponse(synthText) as Record<string, string>) ?? {};
-	} catch {
+	} catch (err) {
+		modelErrors.push((err as Error).message);
 		synthesis = {
 			whats_working:
 				"Analysis complete — see sections below for detailed breakdown.",
@@ -2775,6 +2823,7 @@ RESPOND WITH ONLY A VALID JSON OBJECT:
 		ctx.ui.setStatus("insights", "");
 		ctx.ui.setWidget("insights", undefined);
 		ctx.ui.notify(`✅ Markdown report saved: ${REPORT_MD_PATH}`, "success");
+		notifyModelErrors(ctx, modelErrors);
 		return;
 	}
 
@@ -2782,6 +2831,7 @@ RESPOND WITH ONLY A VALID JSON OBJECT:
 	ctx.ui.setWidget("insights", undefined);
 
 	ctx.ui.notify(`✅ Report saved: ${REPORT_PATH}`, "success");
+	notifyModelErrors(ctx, modelErrors);
 
 	if (!noOpen) {
 		const opener = platform() === "darwin" ? "open" : "xdg-open";
